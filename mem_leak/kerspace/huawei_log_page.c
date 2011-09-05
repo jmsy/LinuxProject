@@ -7,97 +7,21 @@
 #include<asm/stacktrace.h>
 #include<linux/mm.h>
 #include"huawei_log_page.h"
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#define PROC_NAME "leak_info"
+#define LOG_PAGE_TRACE_LEVEL	15
 
-#define ALLOC   0
-#define FREE    1
-
-#define LOG_PAGE_TRACE_LEVEL 26
-#define LOG_MODULE_MAX_NUM  4
-
-/*
- * dump_trace时，skip的调用栈数目。
- */
-/*
- * 以下是该值为0时的输出示例。
- *
- * [   93.800915] ----- print_log_page ---
- * [   93.800916] start addr = 0x        3ffbf000
- * [   93.800917]  end  addr = 0x        3ffc0000
- * [   93.800918] call trace:
- * [   93.800920]      0    :[<0xffffffff810061dc>] dump_trace+0x6c/0x2d0
- * [   93.800922]      1    :[<0xffffffffa040153f>] get_lp_call_stack+0x5f/0x100 [huawei_log_page]
- * [   93.800925]      2    :[<0xffffffffa04017ff>] alloc_pages_nodemask_entry_handler+0x2f/0x50 [huawei_log_page]
- * [   93.800928]      3    :[<0xffffffff8139a85a>] pre_handler_kretprobe+0xaa/0x1a0
- * [   93.800930]      4    :[<0xffffffff81399283>] kprobe_handler+0x113/0x2d0
- * [   93.800932]      5    :[<0xffffffff81399495>] kprobe_exceptions_notify+0x55/0x90
- * [   93.800934]      6    :[<0xffffffff81399c27>] notifier_call_chain+0x37/0x70
- * [   93.800936]      7    :[<0xffffffff810684ed>] notify_die+0x2d/0x40
- * [   93.800938]      8    :[<0xffffffff8139796b>] do_int3+0x5b/0xc0
- * [   93.800940]      9    :[<0xffffffff8139725d>] int3+0x2d/0x40
- * [   93.800942]     10    :[<0xffffffff810babe1>] __alloc_pages_nodemask+0x1/0x140
- * [   93.800944]     11    :[<0xffffffff810be1fe>] __do_page_cache_readahead+0xce/0x220
- * [   93.800946]     12    :[<0xffffffff810be36c>] ra_submit+0x1c/0x30
- * [   93.800948]     13    :[<0xffffffff810b549e>] do_generic_file_read+0x33e/0x460
- * [   93.800950]     14    :[<0xffffffff810b5cd6>] generic_file_aio_read+0xd6/0x1f0
- * [   93.800952]     15    :[<0xffffffff810fc233>] do_sync_read+0xe3/0x130
- * [   93.800954]     16    :[<0xffffffff810fc9d7>] vfs_read+0xc7/0x130
- * [   93.800956]     17    :[<0xffffffff810fcb43>] sys_read+0x53/0xa0
- * [   93.800958]     18    :[<0xffffffff81002f7b>] system_call_fastpath+0x16/0x1b
- * [   93.800960]     19    :[<0x    7ffb99a15f30>] 0x7ffb99a15f30
- * [   93.800962]     20    :[<0x               0>] (null)
- * [   93.800963]     21    :[<0x               0>] (null)
- * [   93.800964]     22    :[<0x               0>] (null)
- * [   93.800965]     23    :[<0x               0>] (null)
- * [   93.800966]     24    :[<0x               0>] (null)
- * [   93.800967]     25    :[<0x               0>] (null)
- * [   93.800969] module *mod[0] = ffffffffa0402760, name = huawei_log_page
- * [   93.800970] module *mod[1] = (null), name = 
- * [   93.800971] module *mod[2] = (null), name = 
- * [   93.800972] module *mod[3] = (null), name = 
- */
-#define KPROBES_SKIP_NUM    8
+#define KPROBES_SKIP_NUM    10
 
 /* 
  * Probe up to MAXACTIVE instances concurrently. 
  * MAXACTIVE <= 0 是设置为默认值，max(10, 2*NR_CPUS0
  */
 #define MAXACTIVE -1
-
-unsigned long get_nr_pages(void)
-{
-    unsigned long nr_pages = 0;
-    unsigned long nid;
-    
-    for_each_online_node(nid) {
-        pg_data_t *pgdat = NODE_DATA(nid);
-        enum zone_type j;
-        unsigned long zone_start_pfn = pgdat->node_start_pfn;
-
-        for(j = 0; j < MAX_NR_ZONES; j++) {
-            struct zone *zone = pgdat->node_zones + j;
-            unsigned long size = zone->spanned_pages;
-            unsigned long start_pfn = zone_start_pfn;
-            unsigned long end_pfn = start_pfn + size;
-            unsigned long pfn;
-
-            for(pfn = start_pfn; pfn < end_pfn; pfn++) {
-                if(!pfn_valid(pfn))
-                    continue;
-                
-                nr_pages++;
-            }
-            zone_start_pfn += size;
-        }
-    }
-
-    return nr_pages;
-}
-
-struct lp_module_info_struct {
-    struct module *mod;
-    char name[MODULE_NAME_LEN];
-};
-
+static int leak_time=10;
+struct list_head node_head;
+LIST_HEAD(node_head);
 struct log_page_struct {
     union {
         /*
@@ -111,7 +35,7 @@ struct log_page_struct {
          */
         unsigned int order;
     };
-
+	long alloc_time;
     /*
      * 红黑树所需要的节点
      */
@@ -129,11 +53,6 @@ struct log_page_struct {
      * LOG_PAGE_TRACE_LEVEL是追溯的调用栈的深度。
      */
     unsigned long entries[LOG_PAGE_TRACE_LEVEL];
-
-    /*
-     * 该次内存分配时调用栈上出现到内核模块及相应信息。
-     */
-    struct lp_module_info_struct lp_module_info[LOG_MODULE_MAX_NUM];
 };
 
 static struct lp_pool_struct {
@@ -153,7 +72,8 @@ int init_lp_pool(void)
     void *addr;
     unsigned long i;
 
-    nr_pages = get_nr_pages();
+    //nr_pages = get_nr_pages();
+	nr_pages = totalram_pages;
     size = nr_pages * sizeof(struct log_page_struct);
     addr = vmalloc(size);
     
@@ -416,10 +336,6 @@ void get_lp_call_stack(struct log_page_struct *lp)
 {
     struct st *st;
     unsigned long stack;
-    int module_index = 0;
-    int i=0;
-    struct module *last_mod = NULL;
-
     st = alloc_st();
 
     st->nr_entries = 0;
@@ -429,63 +345,7 @@ void get_lp_call_stack(struct log_page_struct *lp)
 
     dump_trace(NULL, NULL, &stack, 0, &hw_save_stack_ops, st);
 
-    for(i=0;i<LOG_PAGE_TRACE_LEVEL;i++)
-    {
-        struct module *mod;
-
-        mod = __module_address((unsigned long)(lp->entries[i]));
-        if(!mod)
-            continue;
-
-        /*
-         * 避免同样的模块连续出现
-         */
-        if(mod == last_mod)
-            continue;
-
-        last_mod = mod;
-
-        lp->lp_module_info[module_index].mod = mod;
-        memcpy(lp->lp_module_info[module_index].name, mod->name, sizeof(char) * MODULE_NAME_LEN );
-
-        module_index ++;
-        if(module_index == 4)
-            break;
-    }
-
     free_st(st);
-}
-
-static void print_log_page(struct log_page_struct *lp);
-
-void do_log_page_alloc(struct page *page, unsigned int order)
-{
-    struct log_page_struct *lp;
-
-    if(!page)
-        return;
-
-    lp = alloc_lp();
-
-    get_lp_call_stack(lp);
-
-    lp->start_page = page;
-    lp->end_page = page + (1 << order);
-
-    printk("################### print_log_page #########\n");
-    print_log_page(lp);
-    printk("###################  -----end----- #########\n");
-
-    spin_lock(&lp_lock);
-    log_page_insert(lp);
-    spin_unlock(&lp_lock);
-}
-
-void log_page_alloc(struct page *page, unsigned int order)
-{
-    do_log_page_alloc(page, order);
-
-    //printk("%s: %p and order = %u\n", __func__, page_address(page), order);
 }
 
 struct log_page_struct *find_lp(struct page *start)
@@ -604,14 +464,17 @@ void do_log_page_free(struct page *page, unsigned int order)
             {
                 struct log_page_struct *new_lp;
                 new_lp = alloc_lp();
-                memcpy(new_lp, lp, sizeof(struct log_page_struct));
+				if(new_lp)
+				{
+					memcpy(new_lp, lp, sizeof(struct log_page_struct));
 
-                new_lp->start_page = end;
-                new_lp->end_page = lp->end_page;
+					new_lp->start_page = end;
+					new_lp->end_page = lp->end_page;
 
-                lp->end_page = start;
+					lp->end_page = start;
 
-                log_page_insert(new_lp);
+					log_page_insert(new_lp);
+				}
             }
             /*
              *   3.2 end == lp->end_page：缩小lp
@@ -646,20 +509,6 @@ void log_page_free(struct page *page, unsigned int order)
 {
     do_log_page_free(page, order);
 
-    //printk("%s: %p and order = %u\n", __func__, page_address(page), order);
-}
-
-void log_page(struct page *page, unsigned int order, int action)
-{
-    if(action == ALLOC)
-        log_page_alloc(page, order);
-    else
-        log_page_free(page, order);
-}
-
-void log_alloc_pages_nodemask(struct page *page, unsigned int order)
-{
-    log_page_alloc(page, order);
 }
 
 static void print_log_page(struct log_page_struct *lp)
@@ -679,39 +528,144 @@ static void print_log_page(struct log_page_struct *lp)
 
     for(i=0;i<LOG_PAGE_TRACE_LEVEL;i++)
     {
-        /*
-         * 没有发现 %sP  和 %sF 的区别。采用dump_stack中的%sP
-         */
         printk("    %2d    :[<0x%16lx>] %pS\n", i, lp->entries[i], (void*)lp->entries[i]);
-        //printk("    %2d    :[<0x%16lx>] %pF\n", i, lp->entries[i], (void*)lp->entries[i]);
     }
-
-    for(i=0;i<LOG_MODULE_MAX_NUM;i++)
+	printk("alloc_time = %li\n",lp->alloc_time);
+}
+struct node
+{
+	struct log_page_struct lp;
+	struct list_head list;
+};
+static void insert_to_list(struct log_page_struct *lp)
+{
+    int i;
+	struct node *new_node;
+    if(!lp)
     {
-        printk("module *mod[%d] = %p, name = %s\n", i, lp->lp_module_info[i].mod, lp->lp_module_info[i].name);
+        printk("----- %s ---\n", __func__);
+        printk("memory not tracked(free or alloc before we track)\n");
+        return;
     }
+	new_node = (struct node *)kmalloc(sizeof(struct node),GFP_KERNEL);
+	if(new_node)
+	{
+		memcpy(&(new_node->lp),lp,sizeof(struct log_page_struct));
+		list_add(&(new_node->list),&node_head);
+	}
+	else
+	{
+		printk("start addr = 0x%16lx\n", (unsigned long)page_address(lp->start_page) - PAGE_OFFSET);
+		printk(" end  addr = 0x%16lx\n", (unsigned long)page_address(lp->end_page) - PAGE_OFFSET);
+		printk("call trace:\n");
+
+		for(i=0;i<LOG_PAGE_TRACE_LEVEL;i++)
+		{
+			printk("    %2d    :[<0x%16lx>] %pS\n", i, lp->entries[i], (void*)lp->entries[i]);
+		}
+	}
 }
 
-void print_log_page_all(void)
+void unregister_probes(void);
+int register_probes(void);
+void exchange_tree_to_list(int time)
 {
     struct rb_root *root = &lp_root;
     struct log_page_struct *lp;
     struct rb_node *node;
-
+	struct timeval tv;
+	do_gettimeofday(&tv);
+	unregister_probes();
+	unregister_probes();
     spin_lock(&lp_lock);
     lp = rb_entry(rb_first(root), struct log_page_struct, lp_node);
 
     while(lp)
     {
-        print_log_page(lp);
+		if(tv.tv_sec-lp->alloc_time>=time)
+		  insert_to_list(lp);
         node = rb_next(&(lp->lp_node));
         if(!node)
             break;
         lp = rb_entry(node, struct log_page_struct, lp_node);
     }
     spin_unlock(&lp_lock);
+	register_probes();
 }
-EXPORT_SYMBOL(print_log_page_all);
+
+static void *proc_seq_start(struct seq_file *s,loff_t *pos)
+{
+	static bool flags = true;
+	if(flags)
+	{
+	  exchange_tree_to_list(leak_time);
+	  flags = false;
+	}
+	if(!list_empty(&node_head))
+	  return node_head.next;
+	else
+	{
+		flags = true;
+		return NULL;
+	}
+}
+
+static void *proc_seq_next(struct seq_file *s,void *v,loff_t *pos)
+{
+	struct list_head *new_node;
+	struct node *temp;
+	new_node = (struct list_head *)v;
+	list_del(new_node);
+	temp = list_entry(new_node,struct node,list);
+	if(temp)
+	  kfree(temp);
+	return NULL;
+
+}
+
+static void proc_seq_stop(struct seq_file *s,void *v)
+{
+}
+
+static int proc_seq_show(struct seq_file *s,void *v)
+{
+	struct list_head *new_node;
+	struct node *temp;
+	int i;
+	new_node = (struct list_head *)v;
+	temp = list_entry(new_node,struct node,list);
+	if(temp)
+	{
+		seq_printf(s,"start addr = 0x%16lx\n",(unsigned long)page_address(temp->lp.start_page)-PAGE_OFFSET);
+		seq_printf(s,"end addr = 0x%16lx\n",(unsigned long)page_address(temp->lp.end_page)-PAGE_OFFSET);
+
+		for(i=0;i<LOG_PAGE_TRACE_LEVEL;i++)
+		{
+			seq_printf(s,"    %2d    :[<0x%16lx>] %pS\n", i, temp->lp.entries[i], (void*)(temp->lp.entries[i]));
+		}
+
+	}
+	return 0;
+}
+
+static struct seq_operations proc_seq_ops = {
+	.start=proc_seq_start,
+	.next=proc_seq_next,
+	.stop=proc_seq_stop,
+	.show=proc_seq_show
+};
+
+static int proc_open(struct inode *inode,struct file *file)
+{
+	return seq_open(file,&proc_seq_ops);
+}
+static struct file_operations proc_file_ops = {
+	.owner=THIS_MODULE,
+	.open=proc_open,
+	.read=seq_read,
+	.llseek=seq_lseek,
+	.release=seq_release
+};
 
 void print_page(struct page *page)
 {
@@ -739,18 +693,22 @@ alloc_pages_nodemask_entry_handler(struct kretprobe_instance *ri,
 {
     struct alloc_pages_nodemask_data *data;
     struct log_page_struct *lp;
-
+	struct timeval tv;
+	do_gettimeofday(&tv);
     lp = alloc_lp();
-    lp->order = regs->si;
+	if(lp)
+	{
+	  lp->order = regs->si;
+  	  lp->alloc_time = tv.tv_sec;
+  	  /*
+  	   * 放到这里来做是因为如果放到ret_handle的话，
+  	   * 有时候不能获取到调用栈。
+  	   */
+  	  get_lp_call_stack(lp);
 
-    /*
-     * 放到这里来做是因为如果放到ret_handle的话，
-     * 有时候不能获取到调用栈。
-     */
-    get_lp_call_stack(lp);
-
-    data = (struct alloc_pages_nodemask_data *)ri->data;
-    data->lp = lp;
+  	  data = (struct alloc_pages_nodemask_data *)ri->data;
+  	  data->lp = lp;
+	}
 
     return 0;
 }
@@ -942,8 +900,12 @@ void unregister_probes(void)
 int huawei_log_page_init(void)
 {
     int ret;
-    printk(KERN_INFO "------------Hi all, %s\n", __func__);
+	struct proc_dir_entry *entry;
+	entry = create_proc_entry(PROC_NAME,0,NULL);
+	if(entry)
+	  entry->proc_fops = &proc_file_ops;
 
+	printk("totalram_pages = %lu\n",totalram_pages);
     ret = init_lp_pool();
     if(ret)
         return ret;
@@ -967,6 +929,7 @@ int huawei_log_page_init(void)
 
 void huawei_log_page_exit(void)
 {
+	remove_proc_entry(PROC_NAME,NULL);
     unregister_probes();
     exit_st_pool();
     exit_lp_pool();

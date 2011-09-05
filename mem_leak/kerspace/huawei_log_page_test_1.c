@@ -37,7 +37,7 @@ int huawei_log_page_test_1_init(void)
 {
 	printk(KERN_INFO "------------Hi all, %s\n", __func__);
 
-//    start();
+    start();
 
 	return 0;
 }
@@ -61,7 +61,7 @@ void end(void)
 
 void huawei_log_page_test_1_exit(void)
 {
-  //  end();
+    end();
 
 	printk(KERN_INFO "------------Goodbye %s\n", __func__);
 }

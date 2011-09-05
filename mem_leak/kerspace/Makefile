@@ -4,9 +4,9 @@
 obj-m += huawei_log_page.o
 #obj-m += print_log_page_all.o
 obj-m += huawei_log_page_test_1.o
-obj-m += huawei_log_page_test_2.o
-obj-m += huawei_log_page_test_3.o
-obj-m += huawei_log_page_test_4.o
+#obj-m += huawei_log_page_test_2.o
+#obj-m += huawei_log_page_test_3.o
+#obj-m += huawei_log_page_test_4.o
 
 #obj-m += huawei_user_space_mem.o
 #obj-m += huawei_user_space_mem_test.o
